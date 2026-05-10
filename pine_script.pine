@@ -1,0 +1,109 @@
+//@version=5
+indicator("KW Volume Breakout vs ADV (14d & 30d) — Webhook Edition",
+          overlay=false, format=format.volume,
+          max_labels_count=500)
+
+// ============================================================
+// INPUTS
+// ============================================================
+shortLen  = input.int(14, "Short ADV Lookback (days)", minval=2)
+longLen   = input.int(30, "Long ADV Lookback (days)",  minval=2)
+buffPctIn = input.float(15.0, "Threshold buffer above ADV (%)", minval=0.0, step=5.0,
+            tooltip="Alert fires when cumulative volume exceeds the HIGHER of the two ADVs by this %.")
+showLbls  = input.bool(true, "Show breakout labels")
+showPlot  = input.bool(true, "Show volume series")
+
+// ============================================================
+// DAILY ADV (timeframe-independent)
+// ============================================================
+[adv_short, adv_long] = request.security(syminfo.tickerid, "D",
+     [ta.sma(volume[1], shortLen), ta.sma(volume[1], longLen)],
+     lookahead=barmerge.lookahead_off)
+
+buffMult   = 1.0 + buffPctIn / 100.0
+adv_max    = math.max(adv_short, adv_long)
+thresh_uni = adv_max * buffMult
+
+// ============================================================
+// INTRADAY CUMULATIVE VOLUME
+// ============================================================
+isNewDay = ta.change(time("D")) != 0
+var float cumVol = 0.0
+cumVol := isNewDay ? volume : nz(cumVol[1]) + volume
+
+var bool fired = false
+if isNewDay
+    fired := false
+
+cross = not fired and cumVol >= thresh_uni and not na(thresh_uni) and thresh_uni > 0
+
+if cross
+    fired := true
+
+// ============================================================
+// PERFORMANCE METRICS (computed from Daily timeframe)
+// ============================================================
+// 52-week high/low (252 trading days)
+[high_52w, low_52w, dailyClose] = request.security(syminfo.tickerid, "D",
+     [ta.highest(high, 252), ta.lowest(low, 252), close],
+     lookahead=barmerge.lookahead_off)
+
+// MTD: compare daily close to month-open close
+[monthOpen, yearOpen] = request.security(syminfo.tickerid, "D",
+     [request.security(syminfo.tickerid, "M", open, lookahead=barmerge.lookahead_off),
+      request.security(syminfo.tickerid, "12M", open, lookahead=barmerge.lookahead_off)],
+     lookahead=barmerge.lookahead_off)
+
+// 14-week return: 14*5 = 70 trading days back
+close_14w_ago = request.security(syminfo.tickerid, "D", close[70], lookahead=barmerge.lookahead_off)
+
+mtd_pct  = monthOpen > 0    ? (dailyClose / monthOpen   - 1.0) * 100.0 : na
+ytd_pct  = yearOpen > 0     ? (dailyClose / yearOpen    - 1.0) * 100.0 : na
+ret_14w  = close_14w_ago > 0 ? (dailyClose / close_14w_ago - 1.0) * 100.0 : na
+
+// ============================================================
+// PLOTS
+// ============================================================
+plot(showPlot ? cumVol     : na, "Cumulative Intraday Volume", color=color.new(color.blue, 0),    linewidth=2)
+plot(showPlot ? adv_short  : na, "14d ADV (raw)",              color=color.new(color.orange, 60), linewidth=1)
+plot(showPlot ? adv_long   : na, "30d ADV (raw)",              color=color.new(color.red, 60),    linewidth=1)
+plot(showPlot ? thresh_uni : na, "Unified Threshold",          color=color.new(color.purple, 0),  linewidth=2)
+
+if showLbls and cross
+    label.new(bar_index, cumVol,
+              str.format("↑ max({0}d,{1}d) +{2}%", shortLen, longLen, buffPctIn),
+              color=color.purple, textcolor=color.white,
+              style=label.style_label_down, size=size.small)
+
+// ============================================================
+// WEBHOOK ALERT (JSON payload)
+// ============================================================
+// In TradingView alert dialog, set Message to: {{strategy.order.alert_message}}
+// Or just use the alert() call below — it auto-populates the message.
+//
+// IMPORTANT: When creating the alert, set "Webhook URL" to your Render endpoint:
+//   https://YOUR-APP.onrender.com/webhook/breakout
+
+if cross
+    jsonPayload = str.format(
+       '\u007B"ticker":"{0}","exchange":"{1}","price":{2},"cum_vol":{3},"threshold":{4},"adv_14d":{5},"adv_30d":{6},"buffer_pct":{7},"high_52w":{8},"low_52w":{9},"mtd_pct":{10},"ytd_pct":{11},"ret_14w":{12},"alert_time":"{13}","secret":"REPLACE_WITH_YOUR_SECRET"\u007D',
+       syminfo.ticker,
+       syminfo.prefix,
+       str.tostring(close, "#.######"),
+       str.tostring(cumVol, "#"),
+       str.tostring(thresh_uni, "#"),
+       str.tostring(adv_short, "#"),
+       str.tostring(adv_long, "#"),
+       str.tostring(buffPctIn, "#.##"),
+       str.tostring(high_52w, "#.######"),
+       str.tostring(low_52w, "#.######"),
+       na(mtd_pct)  ? "null" : str.tostring(mtd_pct,  "#.##"),
+       na(ytd_pct)  ? "null" : str.tostring(ytd_pct,  "#.##"),
+       na(ret_14w)  ? "null" : str.tostring(ret_14w,  "#.##"),
+       str.format_time(time, "yyyy-MM-dd'T'HH:mm:ssZ"))
+
+    alert(jsonPayload, alert.freq_once_per_bar)
+
+// Also keep a classic alertcondition for non-webhook users
+alertcondition(cross, title="Volume crossed unified ADV threshold",
+               message="{{ticker}}: intraday cumulative volume crossed max(14d,30d) ADV + buffer")
